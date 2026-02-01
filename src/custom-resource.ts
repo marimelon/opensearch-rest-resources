@@ -2,6 +2,7 @@ import { readFileSync } from 'fs';
 import { join } from 'path';
 import { Duration, CustomResource, RemovalPolicy, Stack } from 'aws-cdk-lib';
 import { CfnSecurityGroupIngress, IVpc } from 'aws-cdk-lib/aws-ec2';
+import { PolicyStatement } from 'aws-cdk-lib/aws-iam';
 import { SingletonFunction, Runtime, RuntimeFamily, Code } from 'aws-cdk-lib/aws-lambda';
 import { Domain } from 'aws-cdk-lib/aws-opensearchservice';
 import { Secret } from 'aws-cdk-lib/aws-secretsmanager';
@@ -40,6 +41,15 @@ export interface OpenSearchCustomResourceProps {
    * @default RemovalPolicy.DESTROY
    */
   readonly removalPolicy?: RemovalPolicy;
+
+  /**
+   * Whether to use AWS SigV4 authentication instead of HTTP Basic Auth.
+   * When enabled, the Lambda function's IAM role is used for authentication,
+   * and master user secret is not required.
+   *
+   * @default false
+   */
+  readonly useSigV4Auth?: boolean;
 }
 
 export class OpenSearchCustomResource extends Construct {
@@ -48,7 +58,7 @@ export class OpenSearchCustomResource extends Construct {
   constructor(scope: Construct, id: string, props: OpenSearchCustomResourceProps) {
     super(scope, id);
 
-    const { vpc, domain } = props;
+    const { vpc, domain, useSigV4Auth } = props;
 
     const handler = new SingletonFunction(this, 'CustomResourceHandler', {
       runtime: new Runtime('nodejs22.x', RuntimeFamily.NODEJS, { supportsInlineCode: true }),
@@ -61,19 +71,30 @@ export class OpenSearchCustomResource extends Construct {
       vpc,
     });
 
-    const masterUserSecret = domain.node.tryFindChild('MasterUser');
-    if (!(masterUserSecret instanceof Secret)) {
-      throw new Error(`Cannot find a master user secret for domain ${domain.node.path}`);
-    }
-    masterUserSecret.grantRead(handler);
-
     const properties: ResourceProperties = {
       opensearchHost: domain.domainEndpoint,
       restEndpoint: props.restEndpoint,
       payloadJson: props.payloadJson,
-      masterUserSecretArn: masterUserSecret.secretArn,
       schemaVersion: 'v1',
     };
+
+    if (useSigV4Auth) {
+      // Grant IAM permissions for OpenSearch API access
+      handler.addToRolePolicy(new PolicyStatement({
+        actions: ['es:ESHttpPut', 'es:ESHttpDelete'],
+        resources: [`${domain.domainArn}/*`],
+      }));
+      properties.useSigV4Auth = true;
+      properties.region = Stack.of(this).region;
+    } else {
+      // Use HTTP Basic Auth with master user secret
+      const masterUserSecret = domain.node.tryFindChild('MasterUser');
+      if (!(masterUserSecret instanceof Secret)) {
+        throw new Error(`Cannot find a master user secret for domain ${domain.node.path}`);
+      }
+      masterUserSecret.grantRead(handler);
+      properties.masterUserSecretArn = masterUserSecret.secretArn;
+    }
 
     const resource = new CustomResource(this, 'Resource', {
       serviceToken: handler.functionArn,

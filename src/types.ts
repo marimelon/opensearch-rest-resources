@@ -8,10 +8,11 @@ export type ResourceProperties = {
 
   /**
    * ARN of a Secret Manager secret containing username and password for an OpenSearch master user.
+   * Required when useSigV4Auth is false or undefined.
    *
    * JSON Format must be `{ "username": "XXXXX", "password": "XXXXX" }`
    */
-  masterUserSecretArn: string;
+  masterUserSecretArn?: string;
 
   /**
    * A REST endpoint to call from the custom resource handler.
@@ -33,4 +34,19 @@ export type ResourceProperties = {
    * This is used to avoid breaking behavior for existing users e.g. when we add attributes for a custom resource.
    */
   schemaVersion: 'v1';
+
+  /**
+   * Whether to use AWS SigV4 authentication instead of HTTP Basic Auth.
+   * When enabled, the Lambda function's IAM role is used for authentication,
+   * and masterUserSecretArn is not required.
+   *
+   * @default false
+   */
+  useSigV4Auth?: boolean;
+
+  /**
+   * AWS region for SigV4 signing.
+   * Required when useSigV4Auth is true.
+   */
+  region?: string;
 };

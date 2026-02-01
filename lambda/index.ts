@@ -1,18 +1,27 @@
 import { GetSecretValueCommand, SecretsManager } from '@aws-sdk/client-secrets-manager';
+import { defaultProvider } from '@aws-sdk/credential-provider-node';
+import { HttpRequest } from '@smithy/protocol-http';
+import { SignatureV4 } from '@smithy/signature-v4';
+import { Sha256 } from '@aws-crypto/sha256-js';
 import type { CloudFormationCustomResourceEvent, CloudFormationCustomResourceHandler, Context } from 'aws-lambda';
 import type { ResourceProperties } from '../src/types';
 import { setTimeout } from 'timers/promises';
 
 const sm = new SecretsManager({});
 
+interface FetchOptions {
+  url: string;
+  method: string;
+  headers: Headers;
+  body: string | undefined;
+  successStatus: string[];
+}
+
 const fetchWithRetry = async (
-  url: string,
-  method: string,
-  headers: Headers,
-  body: string | undefined,
-  successStatus: string[],
+  options: FetchOptions,
   count = 0
 ): Promise<void> => {
+  const { url, method, headers, body, successStatus } = options;
   const res = await fetch(url, {
     method,
     headers,
@@ -42,7 +51,7 @@ const fetchWithRetry = async (
     const base = count ** 2 * 500;
     const jitter = Math.floor(Math.random() * base);
     await setTimeout(Math.min(base + jitter, 10000));
-    return await fetchWithRetry(url, method, headers, body, successStatus, count + 1);
+    return await fetchWithRetry(options, count + 1);
   }
 
   if (json === undefined) {
@@ -53,33 +62,95 @@ const fetchWithRetry = async (
   }
 };
 
+const createBasicAuthHeaders = (username: string, password: string): Headers => {
+  const headers = new Headers();
+  headers.append('Authorization', 'Basic ' + Buffer.from(username + ':' + password).toString('base64'));
+  headers.append('Content-type', 'application/json');
+  return headers;
+};
+
+const createSigV4SignedHeaders = async (
+  method: string,
+  url: string,
+  body: string | undefined,
+  region: string
+): Promise<Headers> => {
+  const parsedUrl = new URL(url);
+
+  const request = new HttpRequest({
+    method,
+    protocol: parsedUrl.protocol,
+    hostname: parsedUrl.hostname,
+    port: parsedUrl.port ? parseInt(parsedUrl.port) : undefined,
+    path: parsedUrl.pathname,
+    query: Object.fromEntries(parsedUrl.searchParams),
+    headers: {
+      host: parsedUrl.hostname,
+      'Content-Type': 'application/json',
+    },
+    body: body,
+  });
+
+  const signer = new SignatureV4({
+    service: 'es', // OpenSearch Service uses 'es' as the service name
+    region,
+    credentials: defaultProvider(),
+    sha256: Sha256,
+  });
+
+  const signedRequest = await signer.sign(request);
+
+  const headers = new Headers();
+  for (const [key, value] of Object.entries(signedRequest.headers)) {
+    if (value !== undefined) {
+      headers.append(key, value as string);
+    }
+  }
+
+  return headers;
+};
+
 export const handler: CloudFormationCustomResourceHandler = async (event, context) => {
   console.log(JSON.stringify(event));
 
   const { ServiceToken, ...other } = event.ResourceProperties;
   const props = other as ResourceProperties;
-  try {
-    // We refer to a secret here because CloudFormation currently does not support dynamic reference for custom resources.
-    // > Dynamic references for secure values, such as secretsmanager, aren't currently supported in custom resources.
-    // > https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/dynamic-references.html#dynamic-references-secretsmanager
-    const secretValue = await sm.send(new GetSecretValueCommand({ SecretId: props.masterUserSecretArn }));
-    const { username, password } = JSON.parse(secretValue.SecretString!);
 
-    // When using FGAC, https is always enforced.
+  try {
     const baseUrl = `https://${props.opensearchHost}`;
-    const headers = new Headers();
-    headers.append('Authorization', 'Basic ' + Buffer.from(username + ':' + password).toString('base64'));
-    headers.append('Content-type', 'application/json');
+
+    const makeRequest = async (method: string, endpoint: string, body: string | undefined, successStatus: string[]) => {
+      const url = `${baseUrl}/${endpoint}`;
+      let headers: Headers;
+
+      if (props.useSigV4Auth) {
+        // SigV4 authentication (IAM)
+        if (!props.region) {
+          throw new Error('region is required when useSigV4Auth is enabled');
+        }
+        headers = await createSigV4SignedHeaders(method, url, body, props.region);
+      } else {
+        // Basic Auth (master user)
+        if (!props.masterUserSecretArn) {
+          throw new Error('masterUserSecretArn is required when useSigV4Auth is not enabled');
+        }
+        const secretValue = await sm.send(new GetSecretValueCommand({ SecretId: props.masterUserSecretArn }));
+        const { username, password } = JSON.parse(secretValue.SecretString!);
+        headers = createBasicAuthHeaders(username, password);
+      }
+
+      await fetchWithRetry({ url, method, headers, body, successStatus });
+    };
 
     switch (event.RequestType) {
       case 'Create':
       case 'Update': {
         console.log(props.payloadJson);
-        await fetchWithRetry(`${baseUrl}/${props.restEndpoint}`, 'PUT', headers, props.payloadJson, ['OK', 'CREATED']);
+        await makeRequest('PUT', props.restEndpoint, props.payloadJson, ['OK', 'CREATED']);
         break;
       }
       case 'Delete': {
-        await fetchWithRetry(`${baseUrl}/${props.restEndpoint}`, 'DELETE', headers, undefined, ['OK', 'NOT_FOUND']);
+        await makeRequest('DELETE', props.restEndpoint, undefined, ['OK', 'NOT_FOUND']);
         break;
       }
     }

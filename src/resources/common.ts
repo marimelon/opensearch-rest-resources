@@ -21,6 +21,15 @@ export interface ResourcePropsBase {
    * @default RemovalPolicy.DESTROY
    */
   readonly removalPolicy?: RemovalPolicy;
+
+  /**
+   * Whether to use AWS SigV4 authentication instead of HTTP Basic Auth.
+   * When enabled, the Lambda function's IAM role is used for authentication,
+   * and master user secret is not required.
+   *
+   * @default false
+   */
+  readonly useSigV4Auth?: boolean;
 }
 
 const camelToSnakeCase = (str: string) => str.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
